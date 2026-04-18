@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'echo \"$CLAUDE_TOOL_INPUT\" | python3 -c \"\nimport sys, json, re\ndata = json.load(sys.stdin)\ncmd = data.get(\\\"command\\\", \\\"\\\")\ndangers = [\n  r\\\"rm\\s+-rf\\\",\n  r\\\"git\\s+push\\s+--force\\\",\n  r\\\"git\\s+reset\\s+--hard\\\",\n  r\\\"DROP\\s+TABLE\\\",\n  r\\\"DROP\\s+DATABASE\\\",\n  r\\\"truncate\\s+table\\\",\n]\nfor p in dangers:\n  if re.search(p, cmd, re.IGNORECASE):\n    print(f\\\"BLOCKED: dangerous command detected: {p}\\\")\n    sys.exit(1)\nprint(\\\"OK\\\")\n\"'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npm run lint && npm run build && npm run test"
+          }
+        ]
+      }
+    ]
+  }
+}
