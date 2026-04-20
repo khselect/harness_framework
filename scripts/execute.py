@@ -3,7 +3,7 @@
 Harness Step Executor — phase 내 step을 순차 실행하고 자가 교정한다.
 
 Usage:
-    python3 scripts/execute.py <phase-dir> [--push]
+    python3 scripts/execute.py <phase-dir> [--push] [--dry-run] [--no-report]
 """
 
 import argparse
@@ -21,6 +21,314 @@ from typing import Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# ---------------------------------------------------------------------------
+# HTML 리포트 CSS (외부 CDN 없음, 인라인 전용)
+# ---------------------------------------------------------------------------
+
+_HTML_CSS = """
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+       background: #f8f9fa; color: #212529; line-height: 1.5; }
+.container { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
+h1 { font-size: 1.6rem; font-weight: 700; margin-bottom: 4px; }
+h2 { font-size: 1.1rem; font-weight: 600; margin: 28px 0 12px; color: #343a40; }
+.subtitle { color: #6c757d; font-size: 0.9rem; margin-bottom: 24px; }
+
+/* 카드 */
+.card { background: #fff; border: 1px solid #dee2e6; border-radius: 8px;
+        padding: 20px; margin-bottom: 20px; }
+.stats { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; }
+.stat-box { background: #fff; border: 1px solid #dee2e6; border-radius: 8px;
+            padding: 14px 20px; min-width: 120px; text-align: center; }
+.stat-box .val { font-size: 1.8rem; font-weight: 700; }
+.stat-box .lbl { font-size: 0.75rem; color: #6c757d; text-transform: uppercase; letter-spacing: .05em; }
+.val.green { color: #198754; }
+.val.red   { color: #dc3545; }
+.val.orange{ color: #fd7e14; }
+.val.blue  { color: #0d6efd; }
+
+/* 표 */
+table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+th { background: #f1f3f5; text-align: left; padding: 8px 10px;
+     border-bottom: 2px solid #dee2e6; font-weight: 600; white-space: nowrap; }
+td { padding: 8px 10px; border-bottom: 1px solid #f1f3f5; vertical-align: top; }
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: #f8f9fa; }
+
+/* 배지 */
+.badge { display: inline-block; padding: 2px 8px; border-radius: 12px;
+         font-size: 0.75rem; font-weight: 600; white-space: nowrap; }
+.badge-completed { background: #d1e7dd; color: #0f5132; }
+.badge-error     { background: #f8d7da; color: #842029; }
+.badge-blocked   { background: #fff3cd; color: #664d03; }
+.badge-pending   { background: #e2e3e5; color: #41464b; }
+
+/* 토큰 바차트 */
+.bar-wrap { display: flex; height: 18px; border-radius: 4px; overflow: hidden;
+            background: #e9ecef; min-width: 80px; }
+.bar-preamble { background: #6ea8fe; }
+.bar-step     { background: #20c997; }
+.bar-label    { font-size: 0.75rem; color: #6c757d; margin-top: 2px; }
+
+/* 절감률 요약 박스 */
+.savings-box { background: #d1e7dd; border: 1px solid #a3cfbb;
+               border-radius: 8px; padding: 16px 20px; margin-top: 16px; }
+.savings-box .big { font-size: 2rem; font-weight: 800; color: #0f5132; }
+.savings-box p { color: #0f5132; font-size: 0.9rem; margin-top: 4px; }
+
+/* 에러 로그 */
+details { margin-bottom: 10px; }
+details summary { cursor: pointer; font-weight: 600; padding: 8px;
+                  background: #f8d7da; border-radius: 6px; color: #842029; }
+details[open] summary { border-radius: 6px 6px 0 0; }
+pre { background: #212529; color: #f8f9fa; padding: 14px; border-radius: 0 0 6px 6px;
+      font-size: 0.8rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+.raw-json summary { background: #e2e3e5; color: #41464b; }
+.raw-json pre { background: #f8f9fa; color: #212529; border: 1px solid #dee2e6; }
+
+/* 집계 표 링크 */
+a { color: #0d6efd; text-decoration: none; }
+a:hover { text-decoration: underline; }
+"""
+
+
+def _fmt_duration(started: Optional[str], ended: Optional[str]) -> str:
+    """ISO 타임스탬프 두 개를 받아 'Xm Ys' 형식으로 반환한다."""
+    if not started or not ended:
+        return "—"
+    try:
+        fmt = "%Y-%m-%dT%H:%M:%S%z"
+        s = datetime.strptime(started, fmt)
+        e = datetime.strptime(ended, fmt)
+        secs = int((e - s).total_seconds())
+        if secs < 60:
+            return f"{secs}s"
+        return f"{secs // 60}m {secs % 60}s"
+    except Exception:
+        return "—"
+
+
+def _build_phase_html(index: dict, phase_dir: str) -> str:
+    """phases/{phase}/index.json 데이터를 받아 self-contained HTML 문자열을 반환한다."""
+    project = index.get("project", "Project")
+    phase = index.get("phase", phase_dir)
+    steps = index.get("steps", [])
+    created = index.get("created_at", "")
+    completed = index.get("completed_at", "")
+    duration = _fmt_duration(created, completed)
+
+    n_completed = sum(1 for s in steps if s.get("status") == "completed")
+    n_error = sum(1 for s in steps if s.get("status") == "error")
+    n_blocked = sum(1 for s in steps if s.get("status") == "blocked")
+    n_total = len(steps)
+
+    BASELINE_TOKENS = 40_000  # 160K chars / 4 — 단일 세션 기준
+    total_tokens = sum(s.get("token_metrics", {}).get("total_tokens", 0) for s in steps)
+    savings_pct = round((1 - total_tokens / BASELINE_TOKENS) * 100, 1) if total_tokens > 0 else 0
+
+    # --- Step 타임라인 표 ---
+    timeline_rows = []
+    for s in steps:
+        status = s.get("status", "pending")
+        badge = f'<span class="badge badge-{status}">{status}</span>'
+        summary = s.get("summary", "—")
+        if len(summary) > 100:
+            summary = f'<span title="{summary}">{summary[:100]}…</span>'
+        tm = s.get("token_metrics")
+        tok_cell = f"{tm['total_tokens']:,}" if tm else "—"
+        dur = _fmt_duration(s.get("started_at"), s.get("completed_at") or s.get("failed_at") or s.get("blocked_at"))
+        started_short = (s.get("started_at") or "—")[:16].replace("T", " ")
+        timeline_rows.append(
+            f"<tr><td>{s.get('step','')}</td><td>{s.get('name','')}</td>"
+            f"<td>{started_short}</td><td>{dur}</td><td>{badge}</td>"
+            f"<td style='max-width:280px'>{summary}</td><td style='text-align:right'>{tok_cell}</td></tr>"
+        )
+
+    # --- 토큰 바차트 ---
+    bar_rows = []
+    max_tok = max((s.get("token_metrics", {}).get("total_tokens", 0) for s in steps), default=1) or 1
+    for s in steps:
+        tm = s.get("token_metrics")
+        if not tm:
+            bar_rows.append(
+                f"<tr><td>{s.get('step','')}</td><td>{s.get('name','')}</td>"
+                f"<td colspan='3' style='color:#6c757d'>—</td><td>—</td></tr>"
+            )
+            continue
+        pt, st, tt, att = tm["preamble_tokens"], tm["step_tokens"], tm["total_tokens"], tm.get("attempt", 1)
+        pct_p = round(pt / max_tok * 100)
+        pct_s = round(st / max_tok * 100)
+        bar = (f'<div class="bar-wrap" style="width:180px">'
+               f'<div class="bar-preamble" style="width:{pct_p}%"></div>'
+               f'<div class="bar-step" style="width:{pct_s}%"></div>'
+               f'</div><div class="bar-label">preamble {pt:,} + step {st:,}</div>')
+        bar_rows.append(
+            f"<tr><td>{s.get('step','')}</td><td>{s.get('name','')}</td>"
+            f"<td>{bar}</td><td style='text-align:right'>{tt:,}</td><td style='text-align:right'>{att}</td></tr>"
+        )
+
+    # 절감률 박스
+    if total_tokens > 0:
+        savings_html = (
+            f'<div class="savings-box">'
+            f'<div class="big">{savings_pct}% 절감</div>'
+            f'<p>이번 phase 추정 합계 <strong>{total_tokens:,} tokens</strong> vs '
+            f'단일 세션 기준 <strong>{BASELINE_TOKENS:,} tokens</strong></p>'
+            f'<p style="font-size:0.8rem;margin-top:6px;opacity:.8">'
+            f'※ 토큰 수는 문자수 ÷ 4 휴리스틱 추정값입니다.</p>'
+            f'</div>'
+        )
+    else:
+        savings_html = '<p style="color:#6c757d">토큰 데이터 없음 (dry-run 또는 구버전 실행)</p>'
+
+    # --- 에러 로그 ---
+    error_steps = [s for s in steps if s.get("status") == "error" or s.get("error_message")]
+    error_section = ""
+    if error_steps:
+        error_items = []
+        for s in error_steps:
+            msg = s.get("error_message", "(no message)")
+            att = s.get("token_metrics", {}).get("attempt", "?")
+            error_items.append(
+                f'<details><summary>Step {s.get("step")} — {s.get("name")} '
+                f'(시도 {att}회)</summary>'
+                f'<pre>{msg}</pre></details>'
+            )
+        error_section = (
+            f'<h2>⚠ 에러 로그</h2>'
+            f'<div class="card">{"".join(error_items)}</div>'
+        )
+
+    # --- Raw JSON ---
+    raw_json = json.dumps(index, indent=2, ensure_ascii=False)
+
+    now_str = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M KST")
+
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harness Report — {phase}</title>
+<style>{_HTML_CSS}</style>
+</head>
+<body>
+<div class="container">
+  <h1>Harness 실행 리포트</h1>
+  <p class="subtitle">{project} / {phase} &nbsp;·&nbsp; 생성: {now_str}</p>
+
+  <div class="stats">
+    <div class="stat-box"><div class="val blue">{n_total}</div><div class="lbl">Total Steps</div></div>
+    <div class="stat-box"><div class="val green">{n_completed}</div><div class="lbl">Completed</div></div>
+    <div class="stat-box"><div class="val red">{n_error}</div><div class="lbl">Error</div></div>
+    <div class="stat-box"><div class="val orange">{n_blocked}</div><div class="lbl">Blocked</div></div>
+    <div class="stat-box"><div class="val blue">{duration}</div><div class="lbl">Duration</div></div>
+  </div>
+
+  <h2>Step 타임라인</h2>
+  <div class="card" style="overflow-x:auto">
+    <table>
+      <thead><tr>
+        <th>#</th><th>Name</th><th>Started</th><th>Duration</th>
+        <th>Status</th><th>Summary</th><th>Est. Tokens</th>
+      </tr></thead>
+      <tbody>{"".join(timeline_rows)}</tbody>
+    </table>
+  </div>
+
+  <h2>토큰 효율 분석</h2>
+  <div class="card" style="overflow-x:auto">
+    <p style="font-size:0.82rem;color:#6c757d;margin-bottom:12px">
+      <span style="display:inline-block;width:12px;height:12px;background:#6ea8fe;border-radius:2px"></span> Preamble (guardrails + 이전 step 요약) &nbsp;
+      <span style="display:inline-block;width:12px;height:12px;background:#20c997;border-radius:2px"></span> Step 파일
+    </p>
+    <table>
+      <thead><tr>
+        <th>#</th><th>Name</th><th>Token 분포</th>
+        <th style="text-align:right">Total</th><th style="text-align:right">Attempt</th>
+      </tr></thead>
+      <tbody>{"".join(bar_rows)}</tbody>
+    </table>
+    {savings_html}
+  </div>
+
+  {error_section}
+
+  <h2>Raw JSON</h2>
+  <details class="raw-json">
+    <summary>index.json 전체 보기</summary>
+    <pre>{raw_json}</pre>
+  </details>
+</div>
+</body>
+</html>"""
+
+
+def _build_aggregate_html(phases_data: list) -> str:
+    """모든 phase 데이터를 받아 집계 HTML을 반환한다.
+    phases_data: [{"dir": str, "status": str, "index": dict|None}, ...]
+    """
+    now_str = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M KST")
+    BASELINE_TOKENS = 40_000
+
+    rows = []
+    grand_total_tokens = 0
+    for p in phases_data:
+        d = p["dir"]
+        status = p["status"]
+        idx = p.get("index") or {}
+        steps = idx.get("steps", [])
+        n_done = sum(1 for s in steps if s.get("status") == "completed")
+        n_total = len(steps)
+        phase_tokens = sum(s.get("token_metrics", {}).get("total_tokens", 0) for s in steps)
+        grand_total_tokens += phase_tokens
+        dur = _fmt_duration(idx.get("created_at"), idx.get("completed_at"))
+        tok_str = f"{phase_tokens:,}" if phase_tokens else "—"
+        badge = f'<span class="badge badge-{status}">{status}</span>'
+        report_link = f'<a href="{d}/report.html">report.html</a>'
+        rows.append(
+            f"<tr><td>{d}</td><td>{badge}</td><td>{n_done}/{n_total}</td>"
+            f"<td>{dur}</td><td style='text-align:right'>{tok_str}</td><td>{report_link}</td></tr>"
+        )
+
+    grand_savings = round((1 - grand_total_tokens / (BASELINE_TOKENS * max(len(phases_data), 1))) * 100, 1) if grand_total_tokens > 0 else 0
+
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harness 집계 리포트</title>
+<style>{_HTML_CSS}</style>
+</head>
+<body>
+<div class="container">
+  <h1>Harness 프로젝트 집계 리포트</h1>
+  <p class="subtitle">생성: {now_str}</p>
+
+  <div class="card" style="overflow-x:auto">
+    <table>
+      <thead><tr>
+        <th>Phase</th><th>Status</th><th>Steps (완료/전체)</th>
+        <th>소요시간</th><th style="text-align:right">총 Tokens</th><th>리포트</th>
+      </tr></thead>
+      <tbody>{"".join(rows)}</tbody>
+    </table>
+  </div>
+
+  {"" if grand_total_tokens == 0 else f'''<div class="savings-box">
+    <div class="big">{grand_savings}% 절감 (전체 평균)</div>
+    <p>전체 phase 추정 합계 <strong>{grand_total_tokens:,} tokens</strong>
+       vs 단일 세션 기준 <strong>{BASELINE_TOKENS * len(phases_data):,} tokens</strong></p>
+  </div>'''}
+</div>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
+# 진행 표시기
+# ---------------------------------------------------------------------------
 
 @contextlib.contextmanager
 def progress_indicator(label: str):
@@ -50,6 +358,10 @@ def progress_indicator(label: str):
         info.elapsed = time.monotonic() - t0
 
 
+# ---------------------------------------------------------------------------
+# StepExecutor
+# ---------------------------------------------------------------------------
+
 class StepExecutor:
     """Phase 디렉토리 안의 step들을 순차 실행하는 하네스."""
 
@@ -59,7 +371,8 @@ class StepExecutor:
     TZ = timezone(timedelta(hours=9))
 
     def __init__(self, phase_dir_name: str, *, auto_push: bool = False,
-                 dry_run: bool = False, max_retries: int = 3):
+                 dry_run: bool = False, max_retries: int = 3,
+                 generate_report: bool = True):
         self._root = str(ROOT)
         self._phases_dir = ROOT / "phases"
         self._phase_dir = self._phases_dir / phase_dir_name
@@ -67,6 +380,8 @@ class StepExecutor:
         self._top_index_file = self._phases_dir / "index.json"
         self._auto_push = auto_push
         self._dry_run = dry_run
+        self._generate_report = generate_report
+        self._dry_run_metrics: list = []
         self.MAX_RETRIES = max_retries
 
         if not self._phase_dir.is_dir():
@@ -91,6 +406,13 @@ class StepExecutor:
         self._ensure_created_at()
         self._execute_all_steps(guardrails)
         self._finalize()
+
+    # --- 토큰 추정 ---
+
+    @staticmethod
+    def _measure_tokens(text: str) -> int:
+        """문자수 / 4 로 토큰 수를 추정한다 (Claude/GPT 공통 휴리스틱)."""
+        return len(text) // 4
 
     # --- timestamps ---
 
@@ -241,14 +563,24 @@ class StepExecutor:
             print(f"  ERROR: {step_file} not found")
             sys.exit(1)
 
+        step_file_text = step_file.read_text(encoding="utf-8")
+
         if self._dry_run:
-            prompt_len = len(preamble) + len(step_file.read_text())
-            print(f"  [dry-run] Step {step_num} ({step_name}): {step_file.name} OK")
-            print(f"  [dry-run] Estimated prompt length: {prompt_len:,} chars")
+            p_tok = self._measure_tokens(preamble)
+            s_tok = self._measure_tokens(step_file_text)
+            total_tok = p_tok + s_tok
+            print(f"  [dry-run] Step {step_num} ({step_name})")
+            print(f"    Preamble : {len(preamble):>8,} chars  (~{p_tok:,} tokens)")
+            print(f"    Step file: {len(step_file_text):>8,} chars  (~{s_tok:,} tokens)")
+            print(f"    Total    : {len(preamble)+len(step_file_text):>8,} chars  (~{total_tok:,} tokens)")
+            self._dry_run_metrics.append({
+                "step": step_num, "name": step_name,
+                "preamble_tokens": p_tok, "step_tokens": s_tok, "total_tokens": total_tok,
+            })
             return {"step": step_num, "name": step_name, "exitCode": 0,
                     "stdout": "", "stderr": "", "dry_run": True}
 
-        prompt = preamble + step_file.read_text()
+        prompt = preamble + step_file_text
         result = subprocess.run(
             ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", prompt],
             cwd=self._root, capture_output=True, text=True, timeout=1800,
@@ -282,6 +614,8 @@ class StepExecutor:
             print(f"  Auto-push: enabled")
         if self.MAX_RETRIES != 3:
             print(f"  Max retries: {self.MAX_RETRIES}")
+        if self._generate_report and not self._dry_run:
+            print(f"  Report: enabled")
         print(f"{'='*60}")
 
     def _check_blockers(self):
@@ -319,6 +653,13 @@ class StepExecutor:
             step_context = self._build_step_context(index)
             preamble = self._build_preamble(guardrails, step_context, prev_error)
 
+            # 토큰 측정 (Claude 호출 전)
+            step_file = self._phase_dir / f"step{step_num}.md"
+            step_file_text = step_file.read_text(encoding="utf-8") if step_file.exists() else ""
+            preamble_tokens = self._measure_tokens(preamble)
+            step_tokens = self._measure_tokens(step_file_text)
+            total_tokens = preamble_tokens + step_tokens
+
             tag = f"Step {step_num}/{self._total - 1} ({done} done): {step_name}"
             if attempt > 1:
                 tag += f" [retry {attempt}/{self.MAX_RETRIES}]"
@@ -339,9 +680,15 @@ class StepExecutor:
                 for s in index["steps"]:
                     if s["step"] == step_num:
                         s["completed_at"] = ts
+                        s["token_metrics"] = {
+                            "preamble_tokens": preamble_tokens,
+                            "step_tokens": step_tokens,
+                            "total_tokens": total_tokens,
+                            "attempt": attempt,
+                        }
                 self._write_json(self._index_file, index)
                 self._commit_step(step_num, step_name)
-                print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s]")
+                print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s]  (~{total_tokens:,} tokens)")
                 return True
 
             if status == "blocked":
@@ -367,13 +714,23 @@ class StepExecutor:
                         s.pop("error_message", None)
                 self._write_json(self._index_file, index)
                 prev_error = err_msg
-                print(f"  ↻ Step {step_num}: retry {attempt}/{self.MAX_RETRIES} — {err_msg}")
+                print(f"\n  ↻ Step {step_num}: retry {attempt}/{self.MAX_RETRIES}")
+                print(f"  {'─'*52}")
+                for line in err_msg.splitlines()[:10]:
+                    print(f"  {line}")
+                print(f"  {'─'*52}\n")
             else:
                 for s in index["steps"]:
                     if s["step"] == step_num:
                         s["status"] = "error"
                         s["error_message"] = f"[{self.MAX_RETRIES}회 시도 후 실패] {err_msg}"
                         s["failed_at"] = ts
+                        s["token_metrics"] = {
+                            "preamble_tokens": preamble_tokens,
+                            "step_tokens": step_tokens,
+                            "total_tokens": total_tokens,
+                            "attempt": attempt,
+                        }
                 self._write_json(self._index_file, index)
                 self._commit_step(step_num, step_name)
                 print(f"  ✗ Step {step_num}: {step_name} failed after {self.MAX_RETRIES} attempts [{elapsed}s]")
@@ -389,6 +746,8 @@ class StepExecutor:
             pending = next((s for s in index["steps"] if s["status"] == "pending"), None)
             if pending is None:
                 print("\n  All steps completed!")
+                if self._dry_run and self._dry_run_metrics:
+                    self._print_dry_run_summary()
                 return
 
             step_num = pending["step"]
@@ -399,6 +758,62 @@ class StepExecutor:
                     break
 
             self._execute_single_step(pending, guardrails)
+
+    def _print_dry_run_summary(self):
+        """dry-run 완료 후 step별 토큰 추정 요약 표를 출력한다."""
+        BASELINE_TOKENS = 40_000
+        print(f"\n  {'─'*60}")
+        print(f"  [dry-run] 토큰 추정 요약")
+        print(f"  {'─'*60}")
+        header = f"  {'Step':<5} {'Name':<25} {'Preamble':>10} {'Step':>8} {'Total':>8}"
+        print(header)
+        print(f"  {'─'*60}")
+        grand_total = 0
+        for m in self._dry_run_metrics:
+            grand_total += m["total_tokens"]
+            print(f"  {m['step']:<5} {m['name']:<25} "
+                  f"~{m['preamble_tokens']:>8,} ~{m['step_tokens']:>6,} ~{m['total_tokens']:>6,}")
+        savings = round((1 - grand_total / BASELINE_TOKENS) * 100, 1) if grand_total > 0 else 0
+        print(f"  {'─'*60}")
+        print(f"  단일 세션 기준(160K chars):  ~{BASELINE_TOKENS:>8,} tokens")
+        print(f"  이번 phase 예상 합계:         ~{grand_total:>8,} tokens")
+        print(f"  예상 절감률:                   {savings:>8.1f}%")
+        print(f"  {'─'*60}\n")
+
+    # --- HTML 리포트 생성 ---
+
+    def _generate_html_report(self) -> Optional[Path]:
+        """phases/{phase}/report.html을 생성한다. 실패 시 경고만 출력."""
+        try:
+            index = self._read_json(self._index_file)
+            html = _build_phase_html(index, self._phase_dir_name)
+            out = self._phase_dir / "report.html"
+            out.write_text(html, encoding="utf-8")
+            return out
+        except Exception as e:
+            print(f"  WARN: HTML 리포트 생성 실패: {e}")
+            return None
+
+    def _generate_aggregate_report(self) -> Optional[Path]:
+        """phases/report.html — 모든 phase를 집계한 상위 리포트를 생성한다."""
+        try:
+            if not self._top_index_file.exists():
+                return None
+            top = self._read_json(self._top_index_file)
+            phases_data = []
+            for p in top.get("phases", []):
+                phase_idx_file = self._phases_dir / p["dir"] / "index.json"
+                idx = self._read_json(phase_idx_file) if phase_idx_file.exists() else None
+                phases_data.append({"dir": p["dir"], "status": p.get("status", "pending"), "index": idx})
+            if not phases_data:
+                return None
+            html = _build_aggregate_html(phases_data)
+            out = self._phases_dir / "report.html"
+            out.write_text(html, encoding="utf-8")
+            return out
+        except Exception as e:
+            print(f"  WARN: 집계 리포트 생성 실패: {e}")
+            return None
 
     def _finalize(self):
         index = self._read_json(self._index_file)
@@ -421,6 +836,14 @@ class StepExecutor:
                 sys.exit(1)
             print(f"  ✓ Pushed to origin/{branch}")
 
+        if self._generate_report and not self._dry_run:
+            report_path = self._generate_html_report()
+            if report_path:
+                print(f"  ✓ Report: {report_path.relative_to(ROOT)}")
+            agg_path = self._generate_aggregate_report()
+            if agg_path:
+                print(f"  ✓ Aggregate: {agg_path.relative_to(ROOT)}")
+
         print(f"\n{'='*60}")
         print(f"  Phase '{self._phase_name}' completed!")
         print(f"{'='*60}")
@@ -434,10 +857,13 @@ def main():
                         help="Claude를 호출하지 않고 step 파일 존재·guardrails 로딩만 검증")
     parser.add_argument("--max-retries", type=int, default=3,
                         help="Step당 최대 재시도 횟수 (기본값: 3)")
+    parser.add_argument("--no-report", dest="report", action="store_false", default=True,
+                        help="HTML 리포트 생성 비활성화 (기본값: 활성화)")
     args = parser.parse_args()
 
     StepExecutor(args.phase_dir, auto_push=args.push,
-                 dry_run=args.dry_run, max_retries=args.max_retries).run()
+                 dry_run=args.dry_run, max_retries=args.max_retries,
+                 generate_report=args.report).run()
 
 
 if __name__ == "__main__":
